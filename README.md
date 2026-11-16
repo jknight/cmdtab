@@ -27,8 +27,10 @@ So, you like the way Apple does it, but you're using Windows? **cmdtab** for Win
 ### Features
 So why is **cmdtab** *the best* macOS-style window switcher alternative for Windows? Because it packs so many useful features into such a small package without bloat:
 
-- Hotkey to cycle apps (Alt-Tab)
-- Hotkey to cycle windows of the same app (Alt-Tilde/Backquote)
+- Hotkey to cycle apps (Alt-Tab or Win-Tab)
+- Hotkey to cycle windows of the same app (Alt-Tilde/Backquote or Win-Tilde/Backquote)
+- App launcher (Alt-Space or Win-Space): type part of an app name, then press Enter. Up/Down or Tab selects, Esc hides. If no app matches, Enter runs the text as a command (for example `cmd` or a URL)
+- Alt and Win work the same for all hotkeys
 - Reverse direction by holding Shift
 - Can use Arrow Keys and Enter to select
 - Mouse support
@@ -63,6 +65,11 @@ You can further customize the scheduled task created by that command by running 
 
 ## Buildling from source
 **cmdtab** comes with a `CMakeLists.txt` for building with `CMake` and a `Makefile` for building with `make`. I use `make`.
+
+#### MSVC/build.bat
+This requires *Visual Studio* or the *Visual Studio Build Tools* with the C++ workload.
+1. Double-click `build.bat`, or run it from a Command Prompt
+2. *(run cmdtab)* `cmdtab.exe`
 
 #### MSVC/CMake
 These instructions require `git`, `cmake`, and *Visual Studio* or *MSBuild*.

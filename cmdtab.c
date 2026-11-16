@@ -43,6 +43,9 @@
 #include <commoncontrols.h>
 #include <mmsystem.h> // PlaySound
 #include <shellscalingapi.h> // GetDpiForMonitor
+#include <shlobj.h> // App launcher: AppsFolder enumeration
+#include <knownfolders.h> // App launcher: FOLDERID_AppsFolder
+#include <shlguid.h> // App launcher: BHID_EnumItems
 
 #ifdef _MSC_VER
 #pragma comment(lib, "user32.lib")
@@ -52,6 +55,9 @@
 #pragma comment(lib, "version.lib")
 #pragma comment(lib, "winmm.lib") // PlaySound
 #pragma comment(lib, "shcore.lib") // GetDpiForMonitor
+#pragma comment(lib, "shell32.lib") // App launcher
+#pragma comment(lib, "ole32.lib") // App launcher
+#pragma comment(lib, "gdi32.lib")
 #pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='amd64' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #endif
 
@@ -638,8 +644,11 @@ static void AttachDebugConsole(wchar_t *title)
 // Settings
 struct ini {
 	// Hotkeys
-	struct { u32 mod, key, enabled; } hotkeyForApps;
-	struct { u32 mod, key, enabled; } hotkeyForWindows;
+	// Each hotkey is one of 'modifiers' plus 'key'. Alt and Win work equally
+	u32 modifiers[4];       // Virtual key codes. 0 terminates the array
+	struct { u32 key, enabled; } hotkeyForApps;
+	struct { u32 key, enabled; } hotkeyForWindows;
+	struct { u32 key, enabled; } hotkeyForLauncher;
 	// Behavior
 	bool groupByApp;
 	bool fastSwitchingForApps;
@@ -654,6 +663,12 @@ struct ini {
 	u32 iconSize;
 	u32 iconHorzMargin;
 	u32 fontSize;
+	u32 launcherWidth;
+	u32 launcherRows;
+	u32 launcherRowHeight;
+	u32 launcherIconSize;
+	u32 launcherInputHeight;
+	u32 launcherFontSize;
 	// Blacklist
 	struct identifier {
 		u16 *filename;          // Filename without file extension, ex. "explorer". Can be NULL
@@ -688,6 +703,7 @@ static handle      HistoryHooks[2]; // Hook handles for WinEvent window activati
 static handle      History[128];    // Window handles from window activation events (MRU). Deduplicated, so prior activations are moved to the front
 static iz          HistoryCount;    // Number of elements in 'History' array
 static handle      KeyboardHook;    // Handle for low-level keyboard hook
+static u32         ActiveModifier;  // Virtual key code of the modifier that activated the switcher
 static u8          Keyboard[32];    // 256 bits to track key repeat for low-level keyboard hook
 static struct app  Apps[128];       // Apps to be displayed in switcher
 static iz          AppsCount;       // Number of elements in 'Apps' array
@@ -715,14 +731,20 @@ static struct app *MouseApp;        // Pointer to one of the elements in 'Apps' 
 static LRESULT CALLBACK SwitcherWindowProcedure(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 static VOID    CALLBACK EventHookProcedure(HWINEVENTHOOK hook, ULONG event, HWND hwnd, LONG objectid, LONG childid, ULONG threadid, ULONG timestamp);
 static LRESULT CALLBACK KeyboardHookProcedure(INT code, WPARAM wparam, LPARAM lparam);
+static void InitLauncherWindow(handle instance);
+static void DestroyLauncher(void);
+static void ToggleLauncher(void);
+static void HideLauncher(void);
 
 static void InitConfig(void)
 {
 	// Default cmdtab settings
 	Config = (struct ini){
 		// Hotkeys
-		.hotkeyForApps =    { 0x38, 0x0F, true }, // Alt-Tab in scancodes, must be updated during runtime, see InitConfig
-		.hotkeyForWindows = { 0x38, 0x29, true }, // Alt-Tilde/Backquote in scancodes, must be updated during runtime, see InitConfig
+		.modifiers =         { 0x38, VK_LWIN, VK_RWIN }, // Left Alt in scancode (updated during runtime, see below), and both Win keys
+		.hotkeyForApps =     { 0x0F, true }, // Tab in scancode, must be updated during runtime, see InitConfig
+		.hotkeyForWindows =  { 0x29, true }, // Tilde/Backquote in scancode, must be updated during runtime, see InitConfig
+		.hotkeyForLauncher = { 0x39, true }, // Space in scancode, must be updated during runtime, see InitConfig
 		// Behavior
 		.groupByApp              = true,
 		.fastSwitchingForApps    = false,
@@ -737,6 +759,12 @@ static void InitConfig(void)
 		.iconSize                = 64,
 		.iconHorzMargin          =  8,
 		.fontSize                = 16,
+		.launcherWidth           = 640,
+		.launcherRows            = 8,
+		.launcherRowHeight       = 48,
+		.launcherIconSize        = 32,
+		.launcherInputHeight     = 60,
+		.launcherFontSize        = 18,
 		// Blacklist
 		.blacklist = {
 			{ NULL,                       L"ApplicationFrameWindow" },
@@ -747,10 +775,10 @@ static void InitConfig(void)
 	// Initialize runtime-dependent settings, like those dependent on user's current kbd layout
 	// The default key2 is scan code 0x29 (hex) / 41 (decimal)
 	// This is the key that is physically below Esc, left of 1 and above Tab
-	Config.hotkeyForApps.mod = MapVirtualKeyW(Config.hotkeyForApps.mod, MAPVK_VSC_TO_VK_EX);
+	Config.modifiers[0] = MapVirtualKeyW(Config.modifiers[0], MAPVK_VSC_TO_VK_EX);
 	Config.hotkeyForApps.key = MapVirtualKeyW(Config.hotkeyForApps.key, MAPVK_VSC_TO_VK_EX);
-	Config.hotkeyForWindows.mod = MapVirtualKeyW(Config.hotkeyForWindows.mod, MAPVK_VSC_TO_VK_EX);
 	Config.hotkeyForWindows.key = MapVirtualKeyW(Config.hotkeyForWindows.key, MAPVK_VSC_TO_VK_EX);
+	Config.hotkeyForLauncher.key = MapVirtualKeyW(Config.hotkeyForLauncher.key, MAPVK_VSC_TO_VK_EX);
 
 	Config.groupByApp = GetRegKey(L"groupByApp");
 
@@ -840,13 +868,19 @@ static int RunCmdTab(handle instance, u16 *args)
 	i32 _ = CoInitialize(NULL);
 
 	InitSwitcherWindow(instance);
+	InitLauncherWindow(instance);
 	InitWindowActivationTracking();
 	InitKeyboardHook();
 
-	// Run message loop
-	for (MSG msg; GetMessageW(&msg, Switcher, 0, 0) > 0;) DispatchMessageW(&msg); // Not handling -1 errors. Whatever
+	// Run message loop for all windows of this thread (switcher and launcher)
+	// TranslateMessage makes the WM_CHAR messages for the launcher text input
+	for (MSG msg; GetMessageW(&msg, NULL, 0, 0) > 0;) { // Not handling -1 errors. Whatever
+		TranslateMessage(&msg);
+		DispatchMessageW(&msg);
+	}
 
 	// Uninstall keyboard & event hooks
+	DestroyLauncher();
 	UnhookWindowsHookEx(KeyboardHook);
 	UnhookWinEvent(HistoryHooks[1]);
 	UnhookWinEvent(HistoryHooks[0]);
@@ -1541,12 +1575,43 @@ static void ShowSwitcher(void)
 
 static void SendModKeysUp(void)
 {
+	SendInput(1, &(INPUT){.type = INPUT_KEYBOARD, .ki.wVk = ActiveModifier, .ki.dwFlags = KEYEVENTF_KEYUP}, sizeof(INPUT));
+}
+
+static void SendMaskKey(void)
+{
+	// The hook consumes the hotkey key (Tab, Space, ...), so the system sees
+	// only the modifier go down and up. For Win that opens the Start menu, and
+	// for Alt that activates the menu bar of the foreground window. A press of
+	// an unassigned key between the two prevents this. AutoHotkey uses the same
+	// key for the same purpose (its "MenuMaskKey")
 	SendInput(2,
 		(INPUT[]){
-			(INPUT){.type = INPUT_KEYBOARD, .ki.wVk = Config.hotkeyForApps.mod, .ki.dwFlags = KEYEVENTF_KEYUP},
-			(INPUT){.type = INPUT_KEYBOARD, .ki.wVk = Config.hotkeyForWindows.mod, .ki.dwFlags = KEYEVENTF_KEYUP},
+			(INPUT){.type = INPUT_KEYBOARD, .ki.wVk = 0xE8},
+			(INPUT){.type = INPUT_KEYBOARD, .ki.wVk = 0xE8, .ki.dwFlags = KEYEVENTF_KEYUP},
 		},
 		sizeof(INPUT));
+}
+
+static bool IsModifier(u32 keyCode)
+{
+	for (iz i = 0; i < countof(Config.modifiers) && Config.modifiers[i]; i++) {
+		if (Config.modifiers[i] == keyCode) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static u32 GetHeldModifier(void)
+{
+	// Return the first configured modifier that is held, or 0 if none is held
+	for (iz i = 0; i < countof(Config.modifiers) && Config.modifiers[i]; i++) {
+		if (IsKeyDown(Config.modifiers[i])) {
+			return Config.modifiers[i];
+		}
+	}
+	return 0;
 }
 
 static void ShowSelectedWindow(void)
@@ -1620,7 +1685,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 	// switcher. But we need to avoid that, so we skip events that are
 	// injected mod keyups.
 	bool injected = (kbd->flags & LLKHF_INJECTED);
-	if (injected && !keyDown && (keyCode == Config.hotkeyForApps.mod || keyCode == Config.hotkeyForWindows.mod)) {
+	if (injected && !keyDown && IsModifier(keyCode)) {
 		Log(L"skip INJECTED INPUT %u %s\n", keyCode, keyDown ? L"down" : L"up");
 		goto passMessage;
 	}
@@ -1630,23 +1695,36 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 
 		bool keyRepeat = SetKey(keyCode, keyDown); // Manually track key repeat
 		bool shiftHeld = IsKeyDown(VK_LSHIFT) || IsKeyDown(VK_RSHIFT) || IsKeyDown(VK_SHIFT);
+		u32 heldModifier = keyDown ? GetHeldModifier() : 0; // Alt or Win
 
 		// ========================================
 		// Activation
 		// ========================================
 
+		bool hotkeyForLauncher =
+			keyCode == Config.hotkeyForLauncher.key && heldModifier &&
+			!keyRepeat && Config.hotkeyForLauncher.enabled;
+
+		// Alt-Space or Win-Space - show or hide the app launcher
+		if (hotkeyForLauncher) {
+			SendMaskKey();
+			ToggleLauncher();
+			goto consumeMessage;
+		}
+
 		bool hotkeyForApps =
-			keyCode == Config.hotkeyForApps.key && keyDown &&
-			IsKeyDown(Config.hotkeyForApps.mod) &&
+			keyCode == Config.hotkeyForApps.key && heldModifier &&
 			Config.hotkeyForApps.enabled;
 
-		// First Alt-Tab
+		// First Alt-Tab or Win-Tab
 		if (hotkeyForApps) {
 			UpdateApps();
 			if (AppsCount <= 0) {
 				Log(L"no apps\n");
 				goto passMessage;
 			}
+			ActiveModifier = heldModifier;
+			SendMaskKey();
 			SelectFirstApp(); // Initialize selection
 			if (*SelectedWindow == GetCoreWindow(GetForegroundWindow())) { // Don't select next when on blank desktop
 				SelectNextApp(shiftHeld, !keyRepeat || !Config.wrapbump);
@@ -1662,17 +1740,18 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 		}
 
 		bool hotkeyForWindows =
-			keyCode == Config.hotkeyForWindows.key && keyDown &&
-			IsKeyDown(Config.hotkeyForWindows.mod) &&
+			keyCode == Config.hotkeyForWindows.key && heldModifier &&
 			Config.hotkeyForWindows.enabled;
 
-		// First Alt-Tilde/Backquote
+		// First Alt-Tilde/Backquote or Win-Tilde/Backquote
 		if (hotkeyForWindows) {
 			UpdateApps();
 			if (AppsCount <= 0) {
 				Log(L"no apps\n");
 				goto passMessage;
 			}
+			ActiveModifier = heldModifier;
+			SendMaskKey();
 			SelectFirstApp(); // Initialize selection
 			SelectNextWindow(shiftHeld, !keyRepeat || !Config.wrapbump);
 			if (Config.fastSwitchingForWindows) {
@@ -1687,10 +1766,9 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 
 	} else { // (SelectedWindow != NULL) means switcher is active/visible
 
-		bool mod1Up = keyCode == Config.hotkeyForApps.mod && !keyDown;
-		bool mod2Up = keyCode == Config.hotkeyForWindows.mod && !keyDown;
+		bool modUp = keyCode == ActiveModifier && !keyDown;
 
-		if (mod1Up || mod2Up) {
+		if (modUp) {
 
 			// ========================================
 			// Deactivation
@@ -1870,6 +1948,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			if (keyCode == VK_CONTROL || keyCode == VK_LCONTROL || keyCode == VK_RCONTROL ||
 				keyCode == VK_MENU    || keyCode == VK_LMENU    || keyCode == VK_RMENU    ||
 				keyCode == VK_SHIFT   || keyCode == VK_LSHIFT   || keyCode == VK_RSHIFT   ||
+				keyCode == VK_LWIN    || keyCode == VK_RWIN     ||
 				keyCode == VK_CAPITAL) {
 				Log(L"modifier passthrough\n");
 				goto passMessage;
@@ -2046,6 +2125,9 @@ static LRESULT CALLBACK SwitcherWindowProcedure(HWND hwnd, UINT message, WPARAM 
 			return 1;
 		case WM_CLOSE:
 			return OnSwitcherClose();
+		case WM_DESTROY:
+			PostQuitMessage(0); // The message loop gets messages for all windows, so it must be told to stop
+			return 0;
 		default:
 			return DefWindowProcW(hwnd, message, wparam, lparam);
 	}
@@ -2063,4 +2145,486 @@ static VOID CALLBACK EventHookProcedure(HWINEVENTHOOK hook, ULONG event, HWND hw
 			OnShellWindowActivated(hwnd);
 			break;
 	}
+}
+
+//==============================================================================
+// App launcher (Alt-Space or Win-Space)
+//==============================================================================
+
+// The launcher lists the items of the shell's AppsFolder ("shell:AppsFolder").
+// That folder holds the same apps as the Start menu: desktop apps and Store
+// (UWP) apps. A worker thread reads the folder, so the keyboard hook on the
+// main thread never waits for the shell.
+
+#define WM_LAUNCHER_TOGGLE  (WM_APP + 1)
+#define WM_LAUNCHER_INDEXED (WM_APP + 2) // lparam is a 'struct launchables *' from the worker thread
+
+struct launchable {
+	u16 name[128];              // Display name, ex. "Visual Studio Code"
+	u16 lower[128];             // Lowercase display name, used to match the query
+	ITEMIDLIST *pidl;           // Absolute shell ID list of the AppsFolder item. Opens the app. Free with CoTaskMemFree
+	i32 icon;                   // Index in the system image list, or -1
+	i16 nameLength;
+};
+
+struct launchables {
+	struct launchable items[1024];
+	iz count;
+};
+
+static handle              Launcher;               // Handle for launcher window
+static struct launchables *Launchables;            // Most recent complete index of apps. Owned by main thread
+static volatile LONG       LauncherIndexing;       // 1 while the worker thread reads the AppsFolder
+static u16                 LauncherQuery[128];     // Text that the user typed
+static iz                  LauncherQueryLength;
+static struct launchable  *LauncherResults[16];    // Matches for the query, best match first
+static iz                  LauncherResultsCount;
+static iz                  LauncherSelected;       // Index in 'LauncherResults'
+static HFONT               LauncherQueryFont;
+static HFONT               LauncherItemFont;
+static f32                 LauncherFontScale;      // DPI scale that the fonts were made for
+static IImageList         *LauncherImageList;      // System image list with 48x48 icons
+
+static void FreeLaunchables(struct launchables *index)
+{
+	if (!index) return;
+	for (iz i = 0; i < index->count; i++) {
+		CoTaskMemFree(index->items[i].pidl);
+	}
+	HeapFree(GetProcessHeap(), 0, index);
+}
+
+static DWORD WINAPI IndexLaunchables(void *parameter)
+{
+	// Worker thread: read the AppsFolder and give the result to the main thread
+	i64 start = StartMeasuring();
+	struct launchables *index = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof *index);
+	if (!index || FAILED(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED))) {
+		if (index) HeapFree(GetProcessHeap(), 0, index); // Has no ID lists yet
+		InterlockedExchange(&LauncherIndexing, 0);
+		return 1;
+	}
+	IShellItem *folder = NULL;
+	IEnumShellItems *items = NULL;
+	if (SUCCEEDED(SHGetKnownFolderItem(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, NULL, &IID_IShellItem, (void **)&folder)) &&
+		SUCCEEDED(IShellItem_BindToHandler(folder, NULL, &BHID_EnumItems, &IID_IEnumShellItems, (void **)&items))) {
+		IShellItem *item;
+		while (index->count < countof(index->items) && IEnumShellItems_Next(items, 1, &item, NULL) == S_OK) {
+			struct launchable *entry = &index->items[index->count];
+			u16 *name = NULL;
+			ITEMIDLIST *pidl = NULL;
+			if (SUCCEEDED(IShellItem_GetDisplayName(item, SIGDN_NORMALDISPLAY, &name)) &&
+				SUCCEEDED(StringCchCopyW(entry->name, countof(entry->name), name)) &&
+				SUCCEEDED(SHGetIDListFromObject((IUnknown *)item, &pidl))) {
+				entry->pidl = pidl;
+				entry->nameLength = StringLength(entry->name, countof(entry->name));
+				StringCchCopyW(entry->lower, countof(entry->lower), entry->name);
+				CharLowerBuffW(entry->lower, entry->nameLength);
+				// Get the icon index here, because the shell loads the icon. That can be slow
+				SHFILEINFOW info = {0};
+				entry->icon = SHGetFileInfoW((u16 *)pidl, 0, &info, sizeof info, SHGFI_PIDL | SHGFI_SYSICONINDEX) ? info.iIcon : -1;
+				index->count++;
+			}
+			CoTaskMemFree(name);
+			IShellItem_Release(item);
+		}
+	}
+	if (items) IEnumShellItems_Release(items);
+	if (folder) IShellItem_Release(folder);
+	CoUninitialize();
+	Print(L"IndexLaunchables (%lli apps) %llims elapsed\n", index->count, FinishMeasuring(start));
+	if (!PostMessageW(Launcher, WM_LAUNCHER_INDEXED, 0, (LPARAM)index)) {
+		FreeLaunchables(index);
+	}
+	InterlockedExchange(&LauncherIndexing, 0);
+	return 0;
+}
+
+static void StartIndexingLaunchables(void)
+{
+	// Start a worker thread, unless one already runs
+	if (InterlockedCompareExchange(&LauncherIndexing, 1, 0) == 0) {
+		handle thread = CreateThread(NULL, 0, IndexLaunchables, NULL, 0, NULL);
+		if (thread) {
+			CloseHandle(thread);
+		} else {
+			InterlockedExchange(&LauncherIndexing, 0);
+		}
+	}
+}
+
+static bool IsWordStart(u16 *text, u16 *position)
+{
+	if (position == text) return true;
+	u16 previous = position[-1];
+	return previous == L' ' || previous == L'-' || previous == L'_' || previous == L'.' || previous == L'(';
+}
+
+static i32 MatchScore(struct launchable *entry, u16 *query, iz queryLength)
+{
+	// Higher is better, 0 is no match. A better kind of match always wins
+	// over a shorter name, because names are shorter than 128 characters
+	i32 shortness = 128 - entry->nameLength;
+	u16 *found = wcsstr(entry->lower, query);
+	if (found == entry->lower) {
+		return 4000 + shortness; // Prefix of the name
+	}
+	for (u16 *at = found; at; at = wcsstr(at + 1, query)) {
+		if (IsWordStart(entry->lower, at)) {
+			return 3000 + shortness; // Prefix of a word in the name
+		}
+	}
+	if (found) {
+		return 2000 + shortness; // Anywhere in the name
+	}
+	// All query characters in sequence, ex. "vsc" for "Visual Studio Code".
+	// Query characters at word starts give more points
+	i32 wordStarts = 0;
+	u16 *at = entry->lower;
+	for (iz i = 0; i < queryLength; i++) {
+		if (query[i] == L' ') continue;
+		while (*at && *at != query[i]) at++;
+		if (!*at) return 0;
+		wordStarts += IsWordStart(entry->lower, at);
+		at++;
+	}
+	return 1000 + wordStarts * 128 + shortness;
+}
+
+static void UpdateLauncherResults(void)
+{
+	LauncherResultsCount = 0;
+	LauncherSelected = 0;
+	if (!Launchables || LauncherQueryLength <= 0) {
+		return;
+	}
+	u16 query[countof(LauncherQuery)];
+	StringCchCopyW(query, countof(query), LauncherQuery);
+	CharLowerBuffW(query, LauncherQueryLength);
+
+	iz maxResults = Config.launcherRows < countof(LauncherResults) ? Config.launcherRows : countof(LauncherResults);
+	i32 scores[countof(LauncherResults)];
+	for (iz i = 0; i < Launchables->count; i++) {
+		struct launchable *entry = &Launchables->items[i];
+		i32 score = MatchScore(entry, query, LauncherQueryLength);
+		if (score <= 0) continue;
+		// Insertion sort into the short result list
+		iz position = LauncherResultsCount;
+		while (position > 0 && scores[position-1] < score) position--;
+		if (position >= maxResults) continue;
+		iz moved = (LauncherResultsCount < maxResults ? LauncherResultsCount : maxResults - 1) - position;
+		memmove(&scores[position+1], &scores[position], sizeof *scores * moved);
+		memmove(&LauncherResults[position+1], &LauncherResults[position], sizeof *LauncherResults * moved);
+		scores[position] = score;
+		LauncherResults[position] = entry;
+		if (LauncherResultsCount < maxResults) LauncherResultsCount++;
+	}
+}
+
+static void ResizeLauncher(void)
+{
+	// Put the launcher at the top third of the monitor where the mouse pointer is
+	f32 scale = GetDpiForMouseMonitor() / 96.0;
+	POINT mousePos = {0};
+	MONITORINFO mi = {.cbSize = sizeof mi};
+	GetCursorPos(&mousePos);
+	GetMonitorInfoW(MonitorFromPoint(mousePos, MONITOR_DEFAULTTONEAREST), &mi);
+
+	u32 w = scale * Config.launcherWidth;
+	u32 h = scale * (Config.launcherInputHeight + LauncherResultsCount * Config.launcherRowHeight);
+	if (LauncherResultsCount > 0) h += scale * 8; // Space below the last row
+	i32 x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - (i32)w) / 2;
+	i32 y = mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top) / 4;
+	SetWindowPos(Launcher, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+
+	if (LauncherFontScale != scale) {
+		LauncherFontScale = scale;
+		if (LauncherQueryFont) DeleteObject(LauncherQueryFont);
+		if (LauncherItemFont) DeleteObject(LauncherItemFont);
+		LauncherQueryFont = CreateFontW(-(i32)(scale * Config.launcherFontSize * 1.3), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+		LauncherItemFont = CreateFontW(-(i32)(scale * Config.launcherFontSize), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+	}
+}
+
+static void OnLauncherQueryChanged(void)
+{
+	UpdateLauncherResults();
+	ResizeLauncher();
+	InvalidateRect(Launcher, NULL, false);
+}
+
+static void ShowLauncher(void)
+{
+	LauncherQueryLength = 0;
+	LauncherQuery[0] = 0;
+	UpdateLauncherResults();
+	ResizeLauncher();
+	ReceiveLastInputEvent(); // Same hack as the switcher, to be allowed to take the foreground
+	ShowWindow(Launcher, SW_SHOW);
+	if (!SetForegroundWindow(Launcher)) {
+		// Without the foreground the launcher gets no keys and no WM_ACTIVATE to hide it
+		Log(L"ERROR couldn't show launcher in foreground\n");
+		HideLauncher();
+		PlaySound(L"SystemHand", NULL, SND_ASYNC);
+		return;
+	}
+	SetFocus(Launcher);
+	InvalidateRect(Launcher, NULL, false);
+	// Read the AppsFolder again, so new and removed apps show the next time
+	StartIndexingLaunchables();
+}
+
+static void HideLauncher(void)
+{
+	ShowWindow(Launcher, SW_HIDE);
+}
+
+static void ToggleLauncher(void)
+{
+	// Called from the keyboard hook. Do the work later in the message loop, so the hook returns quickly
+	PostMessageW(Launcher, WM_LAUNCHER_TOGGLE, 0, 0);
+}
+
+static void LaunchSelected(void)
+{
+	bool ok = false;
+	AllowSetForegroundWindow(ASFW_ANY); // Let the app that starts come to the foreground
+	if (LauncherResultsCount > 0) {
+		struct launchable *entry = LauncherResults[LauncherSelected];
+		SHELLEXECUTEINFOW info = {.cbSize = sizeof info, .fMask = SEE_MASK_IDLIST | SEE_MASK_FLAG_NO_UI, .lpIDList = entry->pidl, .nShow = SW_SHOWNORMAL};
+		ok = ShellExecuteExW(&info);
+		Log(L"launch %s: %s\n", entry->name, ok ? L"OK" : L"FAILED");
+	} else if (LauncherQueryLength > 0) {
+		// No app matches, so try the text as a command, ex. "cmd", "regedit" or a URL
+		ok = (iz)ShellExecuteW(NULL, NULL, LauncherQuery, NULL, NULL, SW_SHOWNORMAL) > 32;
+		Log(L"run %s: %s\n", LauncherQuery, ok ? L"OK" : L"FAILED");
+	} else {
+		ok = true; // Nothing to do
+	}
+	HideLauncher();
+	if (!ok) {
+		PlaySound(L"SystemHand", NULL, SND_ASYNC);
+	}
+}
+
+static void PaintLauncher(handle hdc)
+{
+	COLORREF WIN_COLOR_BG = RGB(32, 32, 32);
+	COLORREF TXT_COLOR    = RGB(235, 235, 235);
+	COLORREF HINT_COLOR   = RGB(140, 140, 140);
+	COLORREF SEL_COLOR    = GetAccentColor() & 0x00FFFFFF;
+	COLORREF SEL_COLOR_BG = RGB(11, 11, 11);
+	COLORREF LINE_COLOR   = RGB(60, 60, 60);
+
+	f32 scale = LauncherFontScale;
+	i32 pad = scale * 16;
+	i32 inputHeight = scale * Config.launcherInputHeight;
+	i32 rowHeight = scale * Config.launcherRowHeight;
+	i32 iconSize = scale * Config.launcherIconSize;
+
+	RECT windowRect;
+	GetClientRect(Launcher, &windowRect);
+	i32 w = windowRect.right;
+	i32 h = windowRect.bottom;
+
+	// Double buffered drawing to an off-screen bitmap
+	handle memory = CreateCompatibleDC(hdc);
+	handle bitmap = CreateCompatibleBitmap(hdc, w, h);
+	handle oldBitmap = SelectObject(memory, bitmap);
+
+	HBRUSH background = CreateSolidBrush(WIN_COLOR_BG);
+	FillRect(memory, &windowRect, background);
+	SetBkMode(memory, TRANSPARENT);
+
+	// Query text, or a hint when there is no query
+	HFONT oldFont = SelectObject(memory, LauncherQueryFont);
+	RECT queryRect = {pad, 0, w - pad, inputHeight};
+	if (LauncherQueryLength > 0) {
+		SetTextColor(memory, TXT_COLOR);
+		DrawTextW(memory, LauncherQuery, LauncherQueryLength, &queryRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+	} else {
+		SetTextColor(memory, HINT_COLOR);
+		u16 *hint = Launchables ? L"Type to search apps" : L"Finding apps...";
+		DrawTextW(memory, hint, -1, &queryRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+	}
+	// Caret after the text
+	RECT measured = {0};
+	DrawTextW(memory, LauncherQuery, LauncherQueryLength, &measured, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+	i32 caretX = pad + (LauncherQueryLength > 0 ? measured.right - measured.left : 0) + scale * 1;
+	if (caretX > w - pad) caretX = w - pad;
+	TEXTMETRICW metrics;
+	GetTextMetricsW(memory, &metrics);
+	RECT caret = {caretX, (inputHeight - metrics.tmHeight) / 2, caretX + (scale * 2 > 1 ? scale * 2 : 1), (inputHeight + metrics.tmHeight) / 2};
+	HBRUSH caretBrush = CreateSolidBrush(SEL_COLOR);
+	FillRect(memory, &caret, caretBrush);
+	DeleteObject(caretBrush);
+
+	if (LauncherResultsCount > 0) {
+		// Line between the query and the results
+		RECT line = {pad, inputHeight - 1, w - pad, inputHeight};
+		HBRUSH lineBrush = CreateSolidBrush(LINE_COLOR);
+		FillRect(memory, &line, lineBrush);
+		DeleteObject(lineBrush);
+
+		SelectObject(memory, LauncherItemFont);
+		SetTextColor(memory, TXT_COLOR);
+		HBRUSH selectionBrush = CreateSolidBrush(SEL_COLOR_BG);
+		HPEN selectionPen = CreatePen(PS_SOLID, scale * 2, SEL_COLOR);
+		for (iz i = 0; i < LauncherResultsCount; i++) {
+			struct launchable *entry = LauncherResults[i];
+			i32 top = inputHeight + scale * 4 + i * rowHeight;
+			if (i == LauncherSelected) {
+				HBRUSH oldBrush = SelectObject(memory, selectionBrush);
+				HPEN oldPen = SelectObject(memory, selectionPen);
+				RoundRect(memory, pad / 2, top + scale * 2, w - pad / 2, top + rowHeight - scale * 2, scale * 10, scale * 10);
+				SelectObject(memory, oldPen);
+				SelectObject(memory, oldBrush);
+			}
+			if (entry->icon >= 0 && LauncherImageList) {
+				HICON icon = NULL;
+				if (SUCCEEDED(IImageList_GetIcon(LauncherImageList, entry->icon, ILD_TRANSPARENT, &icon)) && icon) {
+					DrawIconEx(memory, pad, top + (rowHeight - iconSize) / 2, icon, iconSize, iconSize, 0, NULL, DI_NORMAL);
+					DestroyIcon(icon);
+				}
+			}
+			RECT textRect = {pad + iconSize + pad * 3 / 4, top, w - pad, top + rowHeight};
+			DrawTextW(memory, entry->name, entry->nameLength, &textRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+		}
+		DeleteObject(selectionPen);
+		DeleteObject(selectionBrush);
+	}
+
+	BitBlt(hdc, 0, 0, w, h, memory, 0, 0, SRCCOPY);
+
+	SelectObject(memory, oldFont);
+	SelectObject(memory, oldBitmap);
+	DeleteObject(bitmap);
+	DeleteObject(background);
+	DeleteDC(memory);
+}
+
+static void OnLauncherChar(u16 c)
+{
+	if (c == L'\b') { // Backspace - remove the last character
+		if (LauncherQueryLength > 0) {
+			LauncherQuery[--LauncherQueryLength] = 0;
+		}
+	} else if (c == 0x7F) { // Ctrl-Backspace - remove all text
+		LauncherQueryLength = 0;
+		LauncherQuery[0] = 0;
+	} else if (c >= L' ' && LauncherQueryLength < countof(LauncherQuery) - 1) {
+		LauncherQuery[LauncherQueryLength++] = c;
+		LauncherQuery[LauncherQueryLength] = 0;
+	} else {
+		return; // Other control characters, ex. Enter, Esc and Tab
+	}
+	OnLauncherQueryChanged();
+}
+
+static void OnLauncherKeyDown(u32 key)
+{
+	switch (key) {
+		case VK_ESCAPE:
+			HideLauncher();
+			break;
+		case VK_RETURN:
+			LaunchSelected();
+			break;
+		case VK_UP:
+			if (LauncherResultsCount > 0) {
+				LauncherSelected = (LauncherSelected + LauncherResultsCount - 1) % LauncherResultsCount;
+				InvalidateRect(Launcher, NULL, false);
+			}
+			break;
+		case VK_DOWN:
+		case VK_TAB:
+			if (LauncherResultsCount > 0) {
+				LauncherSelected = (LauncherSelected + 1) % LauncherResultsCount;
+				InvalidateRect(Launcher, NULL, false);
+			}
+			break;
+	}
+}
+
+static LRESULT CALLBACK LauncherWindowProcedure(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
+{
+	switch (message) {
+		case WM_PAINT: {
+			PAINTSTRUCT ps;
+			if (BeginPaint(hwnd, &ps)) {
+				PaintLauncher(ps.hdc);
+				EndPaint(hwnd, &ps);
+			}
+			return 0;
+		}
+		case WM_ERASEBKGND:
+			return 1; // WM_PAINT draws the full window
+		case WM_CHAR:
+			OnLauncherChar((u16)wparam);
+			return 0;
+		case WM_KEYDOWN:
+			OnLauncherKeyDown((u32)wparam);
+			return 0;
+		case WM_SYSKEYDOWN:
+		case WM_SYSCHAR:
+			return 0; // Alt keys go nowhere, so DefWindowProc does not beep or open a menu
+		case WM_LBUTTONDOWN: {
+			// Click a result to launch it
+			i32 y = (i16)HIWORD(lparam) - LauncherFontScale * (Config.launcherInputHeight + 4);
+			i32 row = y >= 0 ? y / (i32)(LauncherFontScale * Config.launcherRowHeight) : -1;
+			if (row >= 0 && row < LauncherResultsCount) {
+				LauncherSelected = row;
+				LaunchSelected();
+			}
+			return 0;
+		}
+		case WM_ACTIVATE:
+			if (LOWORD(wparam) == WA_INACTIVE) {
+				HideLauncher(); // Hide when the user clicks somewhere else
+			}
+			return 0;
+		case WM_LAUNCHER_TOGGLE:
+			if (IsWindowVisible(hwnd)) {
+				HideLauncher();
+			} else {
+				ShowLauncher();
+			}
+			return 0;
+		case WM_LAUNCHER_INDEXED:
+			FreeLaunchables(Launchables);
+			Launchables = (struct launchables *)lparam;
+			if (IsWindowVisible(hwnd)) {
+				OnLauncherQueryChanged(); // Results point into the old index, so find them again
+			} else {
+				LauncherResultsCount = 0;
+			}
+			return 0;
+		default:
+			return DefWindowProcW(hwnd, message, wparam, lparam);
+	}
+}
+
+static void InitLauncherWindow(handle instance)
+{
+	WNDCLASSEXW wcex = {0};
+	wcex.cbSize = sizeof wcex;
+	wcex.lpfnWndProc = LauncherWindowProcedure;
+	wcex.hInstance = instance;
+	wcex.hCursor = LoadCursorW(NULL, IDC_ARROW);
+	wcex.lpszClassName = L"cmdtabLauncher";
+	// TOOLWINDOW so the launcher does not appear in the switcher (see IsAltTabWindow)
+	Launcher = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, MAKEINTATOM(RegisterClassExW(&wcex)), L"cmdtab launcher", WS_POPUP, 0, 0, 0, 0, NULL, NULL, instance, NULL);
+	DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
+	DwmSetWindowAttribute(Launcher, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof corners);
+	SHGetImageList(SHIL_EXTRALARGE, &IID_IImageList, (void **)&LauncherImageList);
+	StartIndexingLaunchables();
+}
+
+static void DestroyLauncher(void)
+{
+	DestroyWindow(Launcher);
+	if (LauncherImageList) IImageList_Release(LauncherImageList);
+	if (LauncherQueryFont) DeleteObject(LauncherQueryFont);
+	if (LauncherItemFont) DeleteObject(LauncherItemFont);
+	FreeLaunchables(Launchables);
 }
